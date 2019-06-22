@@ -4,6 +4,7 @@ use crate::cache::cache_out;
 use crate::core::attributes::{Attributes, Buffered, OnFlush, Prefixed, WithAttributes};
 use crate::core::error;
 use crate::core::input::InputKind;
+use crate::core::label::Labels;
 use crate::core::metrics;
 use crate::core::name::MetricName;
 use crate::core::output::{Output, OutputMetric, OutputScope};
@@ -83,9 +84,7 @@ pub struct GraphiteScope {
 impl OutputScope for GraphiteScope {
     /// Define a metric of the specified type.
     fn new_metric(&self, name: MetricName, kind: InputKind) -> OutputMetric {
-        let mut prefix = self.prefix_prepend(name).join(".");
-        prefix.push(' ');
-
+        let prefix = self.prefix_prepend(name).join(".");
         let scale = match kind {
             // timers are in µs, but we give graphite milliseconds
             InputKind::Timer => 1000,
@@ -95,8 +94,8 @@ impl OutputScope for GraphiteScope {
         let cloned = self.clone();
         let metric = GraphiteMetric { prefix, scale };
 
-        OutputMetric::new(move |value, _labels| {
-            cloned.print(&metric, value);
+        OutputMetric::new(move |value, labels| {
+            cloned.print(&metric, value, labels);
         })
     }
 }
@@ -110,7 +109,7 @@ impl Flush for GraphiteScope {
 }
 
 impl GraphiteScope {
-    fn print(&self, metric: &GraphiteMetric, value: MetricValue) {
+    fn print(&self, metric: &GraphiteMetric, value: MetricValue, labels: Labels) {
         let scaled_value = value / metric.scale;
         let value_str = scaled_value.to_string();
 
@@ -119,7 +118,26 @@ impl GraphiteScope {
         let mut buffer = self.buffer.borrow_mut();
         match start.duration_since(UNIX_EPOCH) {
             Ok(timestamp) => {
+                // add prefix
                 buffer.push_str(&metric.prefix);
+                // add labels?
+                let labels_map = labels.into_map();
+                if !labels_map.is_empty() {
+                    buffer.push_str(";");
+                    let mut i = labels_map.into_iter();
+                    let mut next = i.next();
+                    while let Some((k, v)) = next {
+                        buffer.push_str(&k);
+                        buffer.push_str("=");
+                        buffer.push_str(&v);
+                        next = i.next();
+                        if next.is_some() {
+                            buffer.push_str(";");
+                        }
+                    }
+                }
+                buffer.push(' ');
+                // add value + timestamp
                 buffer.push_str(&value_str);
                 buffer.push(' ');
                 buffer.push_str(&timestamp.as_secs().to_string());
@@ -148,7 +166,7 @@ impl GraphiteScope {
         if buf.is_empty() {
             return Ok(());
         }
-
+        trace!("Sending to graphite: {:?}", &buf.as_str());
         let mut sock = write_lock!(self.socket);
         match sock.write_all(buf.as_bytes()) {
             Ok(()) => {
